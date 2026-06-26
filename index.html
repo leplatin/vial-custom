@@ -1,0 +1,571 @@
+<head>
+    <title>Vial Web (Keychron Edition)</title>
+    <link rel="icon" href="/icon.png" type="image/png">
+    <script src="coi-serviceworker.js"></script>
+<style>
+body {
+    font-family: sans-serif;
+    margin: 0;
+    padding: 0;
+    background-color: #ccc;
+    overscroll-behavior-y: none;
+}
+#canvas {
+    width: 100%;
+    height: 100%;
+}
+#startup {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 90;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+}
+#startup_btn {
+    font-size: 250%;
+    padding: 1em;
+}
+#version {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    margin: 1em;
+    color: #aaa;
+    text-align: right;
+}
+#unlock {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 100;
+    background-color: rgba(0, 0, 0, 0.5);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+#unlock_status {
+    width: 90%;
+    height: 2em;
+}
+#unlock_inner {
+    background-color: #454545;
+    color: white;
+    padding: 1em;
+    border-radius: 1em;
+    width: 30%;
+    text-align: center;
+}
+#error_msg {
+    color: red;
+}
+#dfu_select {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 100;
+    background-color: rgba(0, 0, 0, 0.6);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+#dfu_select_inner {
+    background-color: #454545;
+    color: white;
+    padding: 2em;
+    border-radius: 1em;
+    text-align: center;
+    max-width: 420px;
+}
+#dfu_select_btn {
+    font-size: 130%;
+    margin-top: 1em;
+    padding: 0.6em 1.4em;
+    cursor: pointer;
+}
+#hid_reconnect {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 100;
+    background-color: rgba(0, 0, 0, 0.6);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+#hid_reconnect_inner {
+    background-color: #454545;
+    color: white;
+    padding: 2em;
+    border-radius: 1em;
+    text-align: center;
+    max-width: 420px;
+}
+#hid_reconnect_btn {
+    font-size: 130%;
+    margin-top: 1em;
+    padding: 0.6em 1.4em;
+    cursor: pointer;
+}
+</style>
+</head>
+<body>
+
+<div id="startup">
+    <div id="startup_inner">
+        <input id="startup_btn" type="button" onclick="connect()" value="Start Vial" disabled="true" /><br>
+        <div id="error" style="display:none">
+            <p id="error_msg"></p>
+            <p>You can check web browser support at <a href="https://caniuse.com/webhid" target="_blank">caniuse.com</a>.<br>
+                Latest versions of Chrome, Chromium or Edge are recommended to use Vial Web.<br>
+                You can also download the standalone Vial application from <a href="https://get.vial.today/" target="_blank">get.vial.today</a>.</p>
+        </div>
+    </div>
+    <div id="version">Vial: b22d8ba78a958f5e79bee155b6547bdf73284d02<br>Web: de72f354009b671850fab1f13b67a63b2767bb6e<br>Support: 3bcf423c970300722a04113de1d20c901b177e42</div>
+</div>
+
+<div id="unlock" style="display:none">
+    <div id="unlock_inner">
+        <p>In order to proceed, the keyboard must be set into unlocked mode. You should only perform this operation on computers that you trust.</p>
+        <p>To exit this mode, you will need to replug the keyboard or select Security->Lock from the menu.</p>
+        <p>Press and hold the following keys until the progress bar below fills up:</p>
+        <p><img id="unlock_img"></p>
+        <p><progress id="unlock_status" value="0" max="1"></progress></p>
+    </div>
+</div>
+
+<div id="dfu_select" style="display:none">
+    <div id="dfu_select_inner">
+        <p>The keyboard has rebooted into DFU mode.</p>
+        <p>Click the button below to select the DFU device and begin flashing.</p>
+        <input id="dfu_select_btn" type="button" value="Select DFU Device"
+               onclick="dfuSelectAndFlash()" />
+    </div>
+</div>
+
+<div id="hid_reconnect" style="display:none">
+    <div id="hid_reconnect_inner">
+        <p>Flashing complete! The keyboard is restarting.</p>
+        <p>Click the button below to reconnect the keyboard and restore your layout.</p>
+        <input id="hid_reconnect_btn" type="button" value="Reconnect Keyboard"
+               onclick="hidReconnectAndNotify()" />
+    </div>
+</div>
+
+<canvas id="canvas" oncontextmenu="return false;" tabindex="-1"></canvas>
+
+<script>
+    var Module = {};
+    Module.canvas = document.getElementById("canvas");
+    Module.qtCanvasElements = [Module.canvas];
+
+    function read_timeout() {
+        console.log("device read timed out!");
+        _vialglue_set_response_error();
+    }
+
+    // Timeout for HID read responses.  500ms is too short for wireless
+    // bridge dongles where the round-trip includes USB -> dongle -> 2.4GHz
+    // -> keyboard -> 2.4GHz -> dongle -> USB.  2000ms accommodates the
+    // wireless latency while still detecting genuinely lost packets.
+    var g_read_timeout_ms = 2000;
+
+    function my_onmessage(e) {
+        if (e.data.cmd == "write_device") {
+            g_device.sendReport(0, new Uint8Array(e.data.data));
+            g_read_timeout = setTimeout(read_timeout, g_read_timeout_ms);
+        } else if (e.data.cmd == "unlock_start") {
+            console.log("[vial] unlock_start: showing unlock overlay");
+            var u8 = new Uint8Array(e.data.data);
+            var blob = new Blob([u8], {'type': 'image/png'});
+            var url = URL.createObjectURL(blob);
+            var us = document.getElementById("unlock_status");
+            us.max = 1;
+            us.value = 0;
+            var img = document.getElementById("unlock_img");
+            img.src = url;
+            img.style.width = Math.round(e.data.width / window.devicePixelRatio) + "px";
+            img.style.height = Math.round(e.data.height / window.devicePixelRatio) + "px";
+            document.getElementById("unlock_inner").style.minWidth = img.style.width;
+            document.getElementById("unlock").style.display = "";
+        } else if (e.data.cmd == "unlock_status") {
+            var us = document.getElementById("unlock_status");
+            us.max = Math.max(us.max, e.data.data);
+            us.value = us.max - e.data.data;
+        } else if (e.data.cmd == "unlock_done") {
+            console.log("[vial] unlock_done: hiding unlock overlay");
+            document.getElementById("unlock").style.display = "none";
+        } else if (e.data.cmd == "notify_ready") {
+            console.log("[vial] notify_ready: app is ready, hiding startup screen");
+            clearInterval(g_animation);
+            document.getElementById("startup").style.display = "none";
+        } else if (e.data.cmd == "notify_alive") {
+            console.log("[vial] notify_alive: worker is alive, enabling Start button");
+            document.getElementById("startup_btn").disabled = false;
+        } else if (e.data.cmd == "load_layout") {
+            loadLayout();
+        } else if (e.data.cmd == "load_firmware_bin") {
+            loadFirmwareBin();
+        } else if (e.data.cmd == "save_layout") {
+            saveLayout(e.data.layout);
+        } else if (e.data.cmd == "fatal_error") {
+            console.error("[vial] fatal_error:", e.data.msg);
+            alert(e.data.msg);
+        } else if (e.data.cmd == "dfu_request_usb") {
+            console.log("[vial] dfu_request_usb: calling dfuRequestUsb() from postMessage (legacy path)");
+            dfuRequestUsb();
+        } else if (e.data.cmd == "dfu_flash_start") {
+            console.log("[vial] dfu_flash_start: starting WebUSB DFU flash, firmware size =", e.data.firmware ? e.data.firmware.byteLength : 0);
+            dfuFlash(e.data.firmware);
+        } else if (e.data.cmd == "dfu_show_usb_picker") {
+            console.log("[vial] dfu_show_usb_picker: showing USB DFU device picker overlay");
+            document.getElementById("dfu_select").style.display = "";
+        } else if (e.data.cmd == "dfu_show_hid_picker") {
+            console.log("[vial] dfu_show_hid_picker: showing HID reconnect overlay");
+            document.getElementById("hid_reconnect").style.display = "";
+        }
+    }
+
+    const FILE_OPTIONS = {
+        types: [
+            {
+                description: "Vial layout",
+                accept: { "application/json": [".vil"] },
+            },
+        ],
+        excludeAcceptAllOption: false,
+        multiple: false,
+    };
+
+    async function loadLayout() {
+        if (!window.showOpenFilePicker) {
+            alert("File loading API unavailable. Please use a newer browser.");
+            return;
+        }
+
+        const [handle] = await window.showOpenFilePicker(FILE_OPTIONS);
+
+        if (!handle) {
+            return;
+        }
+
+        const file = await handle.getFile();
+        const layout = await file.text();
+
+        PThread.runningWorkers[0].postMessage({
+            cmd: "py",
+            payload: `import webmain;webmain.window.on_layout_loaded(b${JSON.stringify(layout)})`,
+        });
+    }
+
+    const FIRMWARE_BIN_OPTIONS = {
+        types: [
+            {
+                description: "Firmware binary",
+                accept: { "application/octet-stream": [".bin"] },
+            },
+        ],
+        excludeAcceptAllOption: false,
+        multiple: false,
+    };
+
+    async function loadFirmwareBin() {
+        if (!window.showOpenFilePicker) {
+            alert("File loading API unavailable. Please use a newer browser.");
+            return;
+        }
+
+        let handle;
+        try {
+            [handle] = await window.showOpenFilePicker(FIRMWARE_BIN_OPTIONS);
+        } catch(e) {
+            // User cancelled
+            return;
+        }
+
+        if (!handle) return;
+
+        const file = await handle.getFile();
+        const arrayBuffer = await file.arrayBuffer();
+        const u8 = new Uint8Array(arrayBuffer);
+
+        // Allocate in WASM heap and call Python callback
+        var u8arr = Array.from(u8);
+        // Deliver bytes directly as a JSON array — no heap allocation needed
+        PThread.runningWorkers[0].postMessage({
+            cmd: "py",
+            payload: "import webmain;webmain.window.dfu_flasher.on_web_firmware_loaded(" +
+                     JSON.stringify(file.name) + ", bytes(" + JSON.stringify(u8arr) + "))",
+        });
+    }
+
+    async function saveLayout(layout) {
+        if (window.showSaveFilePicker) {
+            // This shows a file chooser dialog. It's a nicer experience
+            // if available, allowing the user to select a target
+            // filename and directory.
+            const handle = await window.showSaveFilePicker(FILE_OPTIONS);
+            const stream = await handle.createWritable();
+            await stream.write(layout);
+            await stream.close();
+        } else {
+            // If the File System API isn't available, we can at least
+            // trigger a simple download with a hardcoded filename.
+            const download = document.createElement('a');
+            download.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(layout));
+            download.setAttribute('download', 'layout.vil');
+
+            if (document.createEvent) {
+                var event = document.createEvent('MouseEvents');
+                event.initEvent('click', true, true);
+                download.dispatchEvent(event);
+            } else {
+                download.click();
+            }
+        }
+    }
+
+    // ── WebUSB DFU helpers ─────────────────────────────────────────────────
+
+    var g_dfu_device = null;
+
+    function dfuStatusToWorker(json) {
+        PThread.runningWorkers[0].postMessage({cmd: "dfu_status", json: json});
+    }
+
+    // Called directly from the 'Select DFU Device' button onclick — this IS a
+    // user gesture, so navigator.usb.requestDevice() is allowed.
+    async function dfuSelectAndFlash() {
+        console.log("[vial] dfuSelectAndFlash: user clicked, hiding overlay, opening USB picker");
+        document.getElementById("dfu_select").style.display = "none";
+        await dfuRequestUsb();
+    }
+
+    // Triggered by dfu_request_usb from Python.  Asks the user to select the
+    // DFU device then stores it in g_dfu_device.  Reports result via dfu_status.
+    async function dfuRequestUsb() {
+        console.log("[vial] dfuRequestUsb: calling navigator.usb.requestDevice()");
+        try {
+            const usbDevice = await navigator.usb.requestDevice({
+                filters: [{classCode: 0xFE, subclassCode: 0x01}]
+            });
+            console.log("[vial] dfuRequestUsb: device selected:", usbDevice.productName,
+                        "vid=0x" + usbDevice.vendorId.toString(16),
+                        "pid=0x" + usbDevice.productId.toString(16));
+            const ifaces = dfu.findDeviceDfuInterfaces(usbDevice);
+            if (ifaces.length === 0) {
+                console.error("[vial] dfuRequestUsb: no DFU interface found");
+                dfuStatusToWorker(JSON.stringify({status: "error", msg: "No DFU interface found on selected device"}));
+                return;
+            }
+            // Pick the DfuSe (protocol 2) interface if available, otherwise first one
+            const iface = ifaces.find(i => i.alternate.interfaceProtocol === 2) || ifaces[0];
+            const isDfuSe = iface.alternate.interfaceProtocol === 2;
+            console.log("[vial] dfuRequestUsb: using", isDfuSe ? "DfuSe (protocol 2)" : "plain DFU", "interface");
+            g_dfu_device = isDfuSe ? new dfuse.Device(usbDevice, iface)
+                                   : new dfu.Device(usbDevice, iface);
+            g_dfu_device.logMsg = function(msg) {
+                console.log("[vial][dfu]", msg);
+                dfuStatusToWorker(JSON.stringify({status: "log", msg: msg}));
+            };
+            g_dfu_device.logProgress = function(sent, total) {
+                console.log("[vial][dfu] progress:", sent, "/", total,
+                            "(" + Math.round(sent / total * 100) + "%)");
+                dfuStatusToWorker(JSON.stringify({status: "progress", pct: sent / total}));
+            };
+            console.log("[vial] dfuRequestUsb: device ready, posting usb_ready to worker");
+            dfuStatusToWorker(JSON.stringify({status: "usb_ready"}));
+        } catch(e) {
+            console.error("[vial] dfuRequestUsb: failed:", e);
+            dfuStatusToWorker(JSON.stringify({status: "error", msg: "USB device selection failed: " + e.message}));
+        }
+    }
+
+    // Triggered by dfu_flash_start from Python.  firmware is a Uint8Array.
+    async function dfuFlash(firmware) {
+        console.log("[vial] dfuFlash: starting flash,", firmware ? firmware.byteLength : 0, "bytes");
+        if (!g_dfu_device) {
+            console.error("[vial] dfuFlash: no DFU device selected");
+            dfuStatusToWorker(JSON.stringify({status: "error", msg: "No DFU device selected"}));
+            return;
+        }
+        try {
+            console.log("[vial] dfuFlash: opening device");
+            await g_dfu_device.open();
+
+            // Read transfer size from DFU functional descriptor (default 2048)
+            let transferSize = 2048;
+            try {
+                const cfgData = await g_dfu_device.readConfigurationDescriptor(0);
+                for (let d of cfgData.descriptors || []) {
+                    if (d.bDescriptorType === 0x21 && d.wTransferSize) {
+                        transferSize = d.wTransferSize;
+                    }
+                }
+            } catch {}
+            console.log("[vial] dfuFlash: transfer size =", transferSize);
+
+            // Abort any previous DFU operation
+            try { await g_dfu_device.abort(); } catch {}
+            try { await g_dfu_device.poll_until(s => s === dfu.dfuIDLE || s === dfu.dfuDNLOAD_IDLE); } catch {}
+            try { await g_dfu_device.clearStatus(); } catch {}
+
+            console.log("[vial] dfuFlash: starting do_download");
+            await g_dfu_device.do_download(transferSize, firmware.buffer, false);
+
+            console.log("[vial] dfuFlash: done, posting status=done to worker");
+            dfuStatusToWorker(JSON.stringify({status: "done"}));
+        } catch(e) {
+            console.error("[vial] dfuFlash: error:", e);
+            dfuStatusToWorker(JSON.stringify({status: "error", msg: e.message}));
+        } finally {
+            try { await g_dfu_device.close(); } catch {}
+            g_dfu_device = null;
+        }
+    }
+
+    // Called directly from the 'Reconnect Keyboard' button onclick — this IS a
+    // user gesture, so navigator.hid.requestDevice() is allowed.
+    async function hidReconnectAndNotify() {
+        console.log("[vial] hidReconnectAndNotify: user clicked, hiding overlay, opening HID picker");
+        document.getElementById("hid_reconnect").style.display = "none";
+        await dfuReconnectHid();
+    }
+
+    // Called after a successful DFU flash.  Pops a WebHID picker so the user
+    // can reconnect the freshly-flashed keyboard, then wires up the input report
+    // handler exactly like connect() does and notifies Python via dfu_status.
+    async function dfuReconnectHid() {
+        console.log("[vial] dfuReconnectHid: calling navigator.hid.requestDevice()");
+        try {
+            var devices = await navigator.hid.requestDevice({filters: [{usagePage: 0xFF60, usage: 0x61}]});
+            if (!devices || devices.length !== 1) {
+                console.warn("[vial] dfuReconnectHid: no device selected (got", devices ? devices.length : 0, "devices)");
+                dfuStatusToWorker(JSON.stringify({status: "error", msg: "No HID device selected"}));
+                return;
+            }
+            var device = devices[0];
+            console.log("[vial] dfuReconnectHid: selected device:", device.productName,
+                        "vid=0x" + device.vendorId.toString(16),
+                        "pid=0x" + device.productId.toString(16));
+            await device.open();
+            console.log("[vial] dfuReconnectHid: device opened, wiring up input report handler");
+            device.oninputreport = function(ev) {
+                clearTimeout(g_read_timeout);
+                var ptr = _malloc(32);
+                for (var i = 0; i < 32; ++i) {
+                    setValue(ptr + i, ev.data.getUint8(i), "i8");
+                }
+                _vialglue_set_response(ptr);
+                _free(ptr);
+            };
+            g_device = device;
+            var device_desc = {
+                path: "/webhid",
+                vendor_id: device.vendorId,
+                product_id: device.productId,
+                serial_number: "",
+                release_number: 1,
+                manufacturer_string: "",
+                product_string: device.productName,
+                usage_page: 65376,
+                usage: 97,
+                interface_number: 1
+            };
+            _vialglue_set_device_desc(allocateUTF8(JSON.stringify(device_desc)));
+            console.log("[vial] dfuReconnectHid: posting status=reconnected to worker");
+            dfuStatusToWorker(JSON.stringify({status: "reconnected"}));
+        } catch(e) {
+            console.error("[vial] dfuReconnectHid: error:", e);
+            dfuStatusToWorker(JSON.stringify({status: "error", msg: "Reconnect failed: " + e.message}));
+        }
+    }
+
+    async function connect() {
+        var btn = document.getElementById("startup_btn");
+
+        btn.disabled = true;
+        btn.value = "Requesting device list...";
+        console.log("[vial] connect: calling navigator.hid.requestDevice()");
+        devices = await navigator.hid.requestDevice({filters: [{usagePage: 0xFF60, usage: 0x61}]});
+        if (devices.length != 1) {
+            console.warn("[vial] connect: no device selected (got " + devices.length + "), aborting");
+            btn.value = "Start Vial";
+            btn.disabled = false;
+            return;
+        }
+        console.log("[vial] connect: selected device:", devices[0].productName,
+                    "vid=0x" + devices[0].vendorId.toString(16),
+                    "pid=0x" + devices[0].productId.toString(16));
+        btn.value = "Connecting to the device...";
+        await devices[0].open();
+        console.log("[vial] connect: device opened, wiring up input report handler");
+        devices[0].oninputreport = function(ev) {
+            clearTimeout(g_read_timeout);
+            var ptr = _malloc(32);
+            for (var i = 0; i < 32; ++i) {
+                setValue(ptr + i, ev.data.getUint8(i), "i8");
+            }
+            _vialglue_set_response(ptr);
+            _free(ptr);
+        }
+
+        g_device = devices[0];
+        var device_desc = {
+            path: "/webhid",
+            vendor_id: g_device.vendorId,
+            product_id: g_device.productId,
+            serial_number: "",
+            release_number: 1,
+            manufacturer_string: "",
+            product_string: g_device.productName,
+            usage_page: 65376,
+            usage: 97,
+            interface_number: 1
+        };
+        _vialglue_set_device_desc(allocateUTF8(JSON.stringify(device_desc)));
+
+        console.log("[vial] connect: launching Python app in worker");
+        btn.value = "Starting up....";
+        PThread.runningWorkers[0].postMessage({cmd: "py", payload: "import webmain;webmain.main(qtApp)"});
+
+        g_animation = setInterval(update_animation, 500);
+        g_animation_counter = 0;
+    }
+
+    function update_animation() {
+        g_animation_counter = (g_animation_counter + 1) % 5;
+        document.getElementById("startup_btn").value = "Starting up" + ".".repeat(g_animation_counter + 1);
+    }
+
+    function show_error(e) {
+        document.getElementById("startup_btn").style.display = "none";
+        document.getElementById("error").style.display = "";
+        document.getElementById("error_msg").innerHTML = e;
+    }
+
+    if (!("hid" in navigator)) {
+        show_error("Your web browser does not support WebHID");
+    } else if (!HTMLCanvasElement.prototype.transferControlToOffscreen) {
+        show_error("Your web browser does not support OffscreenCanvas");
+    }
+
+    window.onerror = function(message, source, lineno, colno, error) {
+        alert(message);
+    };
+</script>
+
+<script src="dfu.js"></script>
+<script src="main-283da5a69cfbdb7b4f93e92094bab90bdf1e03eab4d65b6bedf469f3edb6ec31.js"></script>
+
+</body>
